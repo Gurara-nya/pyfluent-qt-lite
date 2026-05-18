@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.python-version
+.venv/
+venv/
+env/
+
+# Tooling caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Packaging and PyInstaller
+build/
+dist/
+*.egg-info/
+*.spec.bak
+
+# Fluent/UDF generated outputs
+workspace/
+libudf/
+_tmp*/
+_fluent_menu_*/
+_sweep_smoke_*/
+_sweep_smoke_noudm_*/
+_pyfluent_sweep_smoke_*/
+_real_case_prf_work_*/
+*_probe*.txt
+*_result.txt
+_pyfluent_lite_transcript.log
+*.cas
+*.cas.h5
+*.dat
+*.dat.h5
+*.trn
+*.jou
+*.out
+*.log
+
+# IDE and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.lnk

@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyfluent-qt-lite"
+version = "0.1.0"
+description = "Lightweight Qt desktop control panel for a single PyFluent session."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "LLG" }]
+dependencies = [
+    "ansys-fluent-core",
+    "PySide6",
+]
+
+[project.optional-dependencies]
+build = ["pyinstaller"]
+dev = ["ruff"]
+
+[project.scripts]
+pyfluent-qt-lite = "pyfluent_qt_lite.app:main"
+pyfluent-lite-udf = "pyfluent_qt_lite.udf.cli:main"
+
+[tool.setuptools]
+packages = ["pyfluent_qt_lite", "pyfluent_qt_lite.udf"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
