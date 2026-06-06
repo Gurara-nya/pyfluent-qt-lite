@@ -77,13 +77,15 @@ from .udf.models import BuildSpec
 
 
 TOOL_ROOT = Path(__file__).resolve().parents[1]
-REPO_ROOT = TOOL_ROOT.parent
 APP_NAME = "PyFluent Lite"
 APP_VERSION = __version__
 APP_AUTHOR = "LLG"
 APP_GITHUB_URL = "https://github.com/LLG-P/pyfluent-lite"
-DEFAULT_WORK_DIR = REPO_ROOT / "workspace"
+DEFAULT_FLUENT_OUTPUT_DIR = TOOL_ROOT / "fluent_outputs"
+DEFAULT_WORK_DIR = DEFAULT_FLUENT_OUTPUT_DIR / "manual_sessions__default" / "workspace"
 DEFAULT_UDF_TARGETS = ("host", "node")
+DEFAULT_MESH_DIR = Path(r"D:\Workshop\Mesh\d-40\codex-mesh-package\meshes")
+MESH_FILE_SUFFIXES = (".msh", ".msh.gz", ".msh.h5", ".msh.h5.gz")
 HISTORY_LIMIT = 12
 CONSOLE_FLUSH_MS = 80
 CONSOLE_FORCE_FLUSH_CHARS = 160_000
@@ -672,6 +674,21 @@ def unique_file_path(path: Path) -> Path:
         if not candidate.exists():
             return candidate
     raise FileExistsError(f"无法生成不重名文件路径：{path}")
+
+
+def is_mesh_file_path(path: Path) -> bool:
+    name = path.name.lower()
+    return any(name.endswith(suffix) for suffix in MESH_FILE_SUFFIXES)
+
+
+def format_file_size(size: int) -> str:
+    value = float(max(0, int(size)))
+    units = ("B", "KB", "MB", "GB", "TB")
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} TB"
 
 
 def optional_env_path(key: str) -> Path | None:
@@ -1482,6 +1499,7 @@ class AppSignals(QObject):
 class WindowSignals(QObject):
     task_finished = Signal(str, str)
     interrupt_finished = Signal(str)
+    mesh_files_scanned = Signal(int, str, list, str)
     post_image_ready = Signal(str)
     post_results_scanned = Signal(int, str, list, str, bool)
     post_objects_loaded = Signal(int, str, list, str)
@@ -2044,6 +2062,7 @@ class FluentController:
                 "run_scheme": self._execute_scheme_raw,
                 "read_case": self.read_case,
                 "read_data": self.read_data,
+                "read_mesh": self.read_mesh,
                 "write_case": self.write_case,
                 "write_data": self.write_data,
                 "write_case_data": self.write_case_data,
@@ -3189,6 +3208,12 @@ class FluentController:
     def read_data(self, file_path: str) -> None:
         self._read_fluent_file(file_path, "data", "read-data", "Data")
 
+    def read_mesh(self, file_path: str, keep_case: bool = False) -> None:
+        if keep_case:
+            self._replace_mesh_file(file_path)
+        else:
+            self._read_fluent_file(file_path, "mesh", "read-mesh", "Mesh")
+
     def write_case(self, file_path: str) -> None:
         self._write_fluent_file(file_path, "case", "write-case", "Case")
 
@@ -3232,6 +3257,22 @@ class FluentController:
             self._execute_tui_raw(command)
         self.set_status(f"{label} 已保存")
         self.event(f"{label} 保存完成。")
+
+    def _replace_mesh_file(self, file_path: str) -> None:
+        session = self._require_session()
+        path = require_path(file_path, "Mesh 文件")
+        if not path.exists() or not path.is_file():
+            raise FileNotFoundError(f"Mesh 文件不存在：{path}")
+
+        self.event(f"正在替换 Mesh 并保留当前 Case 设置：{path}")
+        self.set_status("正在替换 Mesh")
+        try:
+            session.settings.file.replace_mesh(file_name=str(path))
+        except Exception as error:
+            self.event(f"settings.file.replace_mesh 不可用，改用 TUI：{type(error).__name__}: {error}")
+            self._execute_tui_raw(f'/file/replace-mesh "{fluent_path(path)}"')
+        self.set_status("Mesh 已替换")
+        self.event("Mesh 替换完成，当前 Case 设置已保留。")
 
     def build_and_load_udf(self, source_dir: str) -> None:
         if self.session is None:
@@ -5082,6 +5123,12 @@ class MainWindow(QMainWindow):
         self.calculation_last_iteration: int | None = None
         self.calculation_stop_requested = False
         self.progress_parse_tail = ""
+        self.mesh_scan_label = ""
+        self.mesh_file_records: list[dict[str, Any]] = []
+        self.mesh_file_paths: list[Path] = []
+        self.mesh_refresh_active = False
+        self.mesh_scan_token = 0
+        self._updating_mesh_table = False
         self.post_image_paths: list[Path] = []
         self.post_windows: list[PostImageWindow] = []
         self.post_results_window: PostResultsWindow | None = None
@@ -5093,6 +5140,7 @@ class MainWindow(QMainWindow):
         self.post_object_refresh_token = 0
         self.output_layout_initialized = False
         self._applying_output_layout = False
+        self._syncing_launch_controls = False
         self.console_flush_timer = QTimer(self)
         self.console_flush_timer.setInterval(CONSOLE_FLUSH_MS)
         self.console_flush_timer.setSingleShot(True)
@@ -5243,12 +5291,13 @@ class MainWindow(QMainWindow):
         file_layout.setContentsMargins(12, 18, 12, 12)
         file_layout.setHorizontalSpacing(8)
         file_layout.setVerticalSpacing(10)
-        self.file_path_edit = self._history_combo("选择或输入 Case/Data 路径")
+        self.file_path_edit = self._history_combo("选择或输入 Case/Data/Mesh 路径")
         self.browse_file_btn = self._tool_button("...")
         self.save_file_btn = self._tool_button("存")
         self.open_file_btn = self._open_button()
         self.read_case_btn = QPushButton("读取 Case")
         self.read_data_btn = QPushButton("读取 Data")
+        self.read_mesh_btn = QPushButton("读取 Mesh")
         self.write_case_btn = QPushButton("保存 Case")
         self.write_data_btn = QPushButton("保存 Data")
         self.write_case_data_btn = QPushButton("保存 Case+Data")
@@ -5258,8 +5307,9 @@ class MainWindow(QMainWindow):
         file_layout.addWidget(self.save_file_btn, 0, 4)
         file_layout.addWidget(self.open_file_btn, 0, 5)
         file_layout.addWidget(QLabel("读取"), 1, 0)
-        file_layout.addWidget(self.read_case_btn, 1, 1, 1, 2)
-        file_layout.addWidget(self.read_data_btn, 1, 3, 1, 3)
+        file_layout.addWidget(self.read_case_btn, 1, 1)
+        file_layout.addWidget(self.read_data_btn, 1, 2)
+        file_layout.addWidget(self.read_mesh_btn, 1, 3, 1, 3)
         file_layout.addWidget(QLabel("保存"), 2, 0)
         file_layout.addWidget(self.write_case_btn, 2, 1)
         file_layout.addWidget(self.write_data_btn, 2, 2)
@@ -5270,6 +5320,79 @@ class MainWindow(QMainWindow):
         file_layout.addWidget(self.file_use_case_btn, 3, 1, 1, 2)
         file_layout.addWidget(self.file_use_work_btn, 3, 3, 1, 3)
         file_layout.setColumnStretch(1, 1)
+
+        mesh_box = QGroupBox("Mesh 文件")
+        mesh_layout = QGridLayout(mesh_box)
+        mesh_layout.setContentsMargins(12, 18, 12, 12)
+        mesh_layout.setHorizontalSpacing(8)
+        mesh_layout.setVerticalSpacing(8)
+        self.mesh_folder_edit = self._history_combo("常用 Mesh 文件夹")
+        self.browse_mesh_folder_btn = self._tool_button("...")
+        self.open_mesh_folder_btn = self._open_button()
+        self.add_mesh_folder_btn = QPushButton("加入常用")
+        self.remove_mesh_folder_btn = QPushButton("移除")
+        self.mesh_recursive_checkbox = QCheckBox("包含子文件夹")
+        self.mesh_recursive_checkbox.setChecked(True)
+        self.mesh_keep_case_checkbox = QCheckBox("读取时保留当前 Case 设置")
+        self.mesh_keep_case_checkbox.setChecked(True)
+        self.show_hidden_mesh_checkbox = QCheckBox("显示隐藏")
+        self.mesh_filter_edit = QLineEdit()
+        self.mesh_filter_edit.setPlaceholderText("按文件名或路径过滤 Mesh")
+        self.mesh_filter_edit.setClearButtonEnabled(True)
+        self.hide_selected_mesh_btn = QPushButton("隐藏选中")
+        self.unhide_selected_mesh_btn = QPushButton("取消隐藏")
+        self.refresh_mesh_files_btn = QPushButton("扫描当前")
+        self.refresh_all_mesh_files_btn = QPushButton("扫描全部")
+        self.read_selected_mesh_btn = QPushButton("读取选中 Mesh")
+        self.mesh_files_label = QLabel("Mesh 0 个")
+        self.mesh_files_label.setObjectName("mutedLabel")
+        self.mesh_file_table = QTableWidget()
+        self.mesh_file_table.setObjectName("meshFileTable")
+        self.mesh_file_table.setColumnCount(5)
+        self.mesh_file_table.setHorizontalHeaderLabels(["文件名", "路径", "修改时间", "大小", "状态"])
+        self.mesh_file_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.mesh_file_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.mesh_file_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.mesh_file_table.setAlternatingRowColors(True)
+        self.mesh_file_table.setSortingEnabled(True)
+        self.mesh_file_table.setWordWrap(False)
+        self.mesh_file_table.setShowGrid(False)
+        self.mesh_file_table.verticalHeader().setVisible(False)
+        self.mesh_file_table.horizontalHeader().setSectionsClickable(True)
+        self.mesh_file_table.horizontalHeader().setStretchLastSection(False)
+        self.mesh_file_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.mesh_file_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.mesh_file_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.mesh_file_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.mesh_file_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.mesh_file_table.setMinimumHeight(220)
+        mesh_layout.addWidget(QLabel("文件夹"), 0, 0)
+        mesh_layout.addWidget(self.mesh_folder_edit, 0, 1, 1, 3)
+        mesh_layout.addWidget(self.browse_mesh_folder_btn, 0, 4)
+        mesh_layout.addWidget(self.open_mesh_folder_btn, 0, 5)
+        mesh_layout.addWidget(self.add_mesh_folder_btn, 1, 1)
+        mesh_layout.addWidget(self.remove_mesh_folder_btn, 1, 2)
+        mesh_layout.addWidget(self.refresh_mesh_files_btn, 1, 3)
+        mesh_layout.addWidget(self.refresh_all_mesh_files_btn, 1, 4)
+        mesh_layout.addWidget(self.read_selected_mesh_btn, 1, 5)
+        mesh_layout.addWidget(self.mesh_recursive_checkbox, 2, 1, 1, 2)
+        mesh_layout.addWidget(self.mesh_keep_case_checkbox, 2, 3, 1, 3)
+        mesh_layout.addWidget(QLabel("过滤"), 3, 0)
+        mesh_layout.addWidget(self.mesh_filter_edit, 3, 1, 1, 3)
+        mesh_layout.addWidget(self.show_hidden_mesh_checkbox, 3, 4)
+        mesh_layout.addWidget(self.hide_selected_mesh_btn, 4, 1)
+        mesh_layout.addWidget(self.unhide_selected_mesh_btn, 4, 2)
+        mesh_layout.addWidget(self.mesh_files_label, 4, 3, 1, 3)
+        mesh_layout.addWidget(self.mesh_file_table, 5, 0, 1, 6)
+        mesh_layout.setColumnStretch(1, 1)
+        mesh_layout.setColumnStretch(3, 1)
+
+        case_data_box = QWidget()
+        case_data_layout = QVBoxLayout(case_data_box)
+        case_data_layout.setContentsMargins(0, 0, 0, 0)
+        case_data_layout.setSpacing(8)
+        case_data_layout.addWidget(file_box)
+        case_data_layout.addWidget(mesh_box)
 
         udf_box = QGroupBox("UDF")
         udf_layout = QGridLayout(udf_box)
@@ -5494,6 +5617,12 @@ class MainWindow(QMainWindow):
         sweep_config_layout.setContentsMargins(10, 10, 10, 10)
         sweep_config_layout.setHorizontalSpacing(8)
         sweep_config_layout.setVerticalSpacing(8)
+        sweep_launch_panel = QFrame()
+        sweep_launch_panel.setObjectName("sweepPanel")
+        sweep_launch_layout = QGridLayout(sweep_launch_panel)
+        sweep_launch_layout.setContentsMargins(10, 10, 10, 10)
+        sweep_launch_layout.setHorizontalSpacing(8)
+        sweep_launch_layout.setVerticalSpacing(8)
         sweep_execute_panel = QFrame()
         sweep_execute_panel.setObjectName("sweepAccentPanel")
         sweep_execute_layout = QGridLayout(sweep_execute_panel)
@@ -5506,6 +5635,23 @@ class MainWindow(QMainWindow):
         self.sweep_base_case_edit = self._history_combo("基准 Case，可留空使用当前 Fluent 状态")
         self.browse_sweep_base_case_btn = self._tool_button("...")
         self.open_sweep_base_case_btn = self._open_button()
+        self.sweep_launch_work_dir_edit = self._history_combo("扫描自动启动 Fluent 的工作目录")
+        self.browse_sweep_launch_work_btn = self._tool_button("...")
+        self.open_sweep_launch_work_btn = self._open_button()
+        self.sweep_launch_dim_combo = QComboBox()
+        self.sweep_launch_dim_combo.addItems(["2D", "3D"])
+        self.sweep_launch_cores_spin = QSpinBox()
+        self.sweep_launch_cores_spin.setRange(1, 256)
+        self.sweep_launch_cores_spin.setValue(1)
+        self.sweep_launch_gui_checkbox = QCheckBox("显示 Fluent GUI")
+        self.sweep_launch_gui_checkbox.setChecked(True)
+        self.sweep_launch_load_scm_on_start_checkbox = QCheckBox("启动后加载 SCM")
+        self.sweep_launch_scm_file_edit = self._history_combo("选择启动后加载的 .scm 文件")
+        self.browse_sweep_launch_scm_btn = self._tool_button("...")
+        self.open_sweep_launch_scm_btn = self._open_button()
+        self.clear_sweep_launch_scm_btn = self._clear_button()
+        self.sweep_launch_status_label = QLabel("当前会话：未启动")
+        self.sweep_launch_status_label.setObjectName("mutedLabel")
         self.sweep_init_workflow_combo = QComboBox()
         self.sweep_post_workflow_combo = QComboBox()
         self.sweep_iterations_spin = QSpinBox()
@@ -5543,11 +5689,32 @@ class MainWindow(QMainWindow):
         sweep_control_row.addWidget(self.stop_sweep_btn)
         self.sweep_scan_dir_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.sweep_base_case_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.sweep_launch_work_dir_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.sweep_launch_scm_file_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.sweep_init_workflow_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.sweep_post_workflow_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.run_sweep_workflow_btn.setMinimumWidth(0)
         self.run_all_sweep_workflow_btn.setMinimumWidth(0)
         self.retry_sweep_btn.setMinimumWidth(0)
+
+        sweep_launch_layout.addWidget(QLabel("Fluent 启动参数"), 0, 0, 1, 2)
+        sweep_launch_layout.addWidget(self.sweep_launch_status_label, 0, 2, 1, 4)
+        sweep_launch_layout.addWidget(QLabel("工作目录"), 1, 0)
+        sweep_launch_layout.addWidget(self.sweep_launch_work_dir_edit, 1, 1, 1, 3)
+        sweep_launch_layout.addWidget(self.browse_sweep_launch_work_btn, 1, 4)
+        sweep_launch_layout.addWidget(self.open_sweep_launch_work_btn, 1, 5)
+        sweep_launch_layout.addWidget(QLabel("维度"), 2, 0)
+        sweep_launch_layout.addWidget(self.sweep_launch_dim_combo, 2, 1)
+        sweep_launch_layout.addWidget(QLabel("核数"), 2, 2)
+        sweep_launch_layout.addWidget(self.sweep_launch_cores_spin, 2, 3)
+        sweep_launch_layout.addWidget(self.sweep_launch_gui_checkbox, 2, 4, 1, 2)
+        sweep_launch_layout.addWidget(self.sweep_launch_load_scm_on_start_checkbox, 3, 0, 1, 2)
+        sweep_launch_layout.addWidget(self.sweep_launch_scm_file_edit, 3, 2, 1, 2)
+        sweep_launch_layout.addWidget(self.browse_sweep_launch_scm_btn, 3, 4)
+        sweep_launch_layout.addWidget(self.open_sweep_launch_scm_btn, 3, 5)
+        sweep_launch_layout.addWidget(self.clear_sweep_launch_scm_btn, 3, 6)
+        sweep_launch_layout.setColumnStretch(1, 1)
+        sweep_launch_layout.setColumnStretch(3, 1)
 
         sweep_config_layout.addWidget(sweep_file_label, 0, 0, 1, 6)
         sweep_config_layout.addWidget(QLabel("扫描目录"), 1, 0)
@@ -5578,6 +5745,7 @@ class MainWindow(QMainWindow):
         sweep_execute_layout.setColumnStretch(1, 1)
         sweep_execute_layout.setColumnStretch(2, 1)
 
+        sweep_batch_layout.addWidget(sweep_launch_panel)
         sweep_batch_layout.addWidget(sweep_config_panel)
         sweep_batch_layout.addWidget(sweep_execute_panel)
 
@@ -5891,7 +6059,7 @@ class MainWindow(QMainWindow):
         self.action_tabs.setUsesScrollButtons(True)
         self.action_tabs.tabBar().setElideMode(Qt.TextElideMode.ElideRight)
         self.action_tabs.addTab(self._tab_page(launch_box), "启动")
-        self.action_tabs.addTab(self._tab_page(file_box), "Case/Data")
+        self.action_tabs.addTab(self._tab_page(case_data_box), "Case/Data")
         self.action_tabs.addTab(self._tab_page(udf_box), "UDF")
         self.action_tabs.addTab(self._tab_page(command_box), "命令")
         self.action_tabs.addTab(self._tab_page(automation_box), "流程")
@@ -5991,17 +6159,33 @@ class MainWindow(QMainWindow):
         self._set_tip(self.start_btn, "启动一个新的 Fluent solver session。这个工具只管理当前这一个实例。")
         self._set_tip(self.stop_btn, "关闭当前由本工具启动的 Fluent session。")
 
-        self._set_tip(self.file_path_edit, "Case/Data 文件路径。可用于启动后读取，也可作为保存路径。")
-        self._set_tip(self.browse_file_btn, "选择已有的 Case 或 Data 文件。")
+        self._set_tip(self.file_path_edit, "Case/Data/Mesh 文件路径。可用于启动后读取，也可作为 Case/Data 保存路径。")
+        self._set_tip(self.browse_file_btn, "选择已有的 Case、Data 或 Mesh 文件。")
         self._set_tip(self.save_file_btn, "选择 Case 或 Case+Data 的保存路径。")
-        self._set_tip(self.open_file_btn, "在资源管理器中打开当前 Case/Data 路径所在文件夹。")
+        self._set_tip(self.open_file_btn, "在资源管理器中打开当前 Case/Data/Mesh 路径所在文件夹。")
         self._set_tip(self.read_case_btn, "将路径中的 case 文件读取到当前 Fluent。")
         self._set_tip(self.read_data_btn, "将路径中的 data 文件读取到当前 Fluent。")
+        self._set_tip(self.read_mesh_btn, "将路径中的 mesh 文件读取到当前 Fluent。")
         self._set_tip(self.write_case_btn, "把当前 Fluent 状态保存为 case 文件。")
         self._set_tip(self.write_data_btn, "把当前 Fluent 数据保存为 data 文件。")
         self._set_tip(self.write_case_data_btn, "把当前 Fluent 状态保存为 case+data。")
         self._set_tip(self.file_use_case_btn, "把启动页的 Case 路径填入当前文件路径。")
         self._set_tip(self.file_use_work_btn, "用工作目录生成默认 case-data 保存路径。")
+        self._set_tip(self.mesh_folder_edit, "常用 Mesh 文件夹。可以输入路径、加入常用，并扫描其中的 .msh 文件。")
+        self._set_tip(self.browse_mesh_folder_btn, "选择一个 Mesh 文件夹。")
+        self._set_tip(self.open_mesh_folder_btn, "在资源管理器中打开当前 Mesh 文件夹。")
+        self._set_tip(self.add_mesh_folder_btn, "把当前 Mesh 文件夹加入常用列表。")
+        self._set_tip(self.remove_mesh_folder_btn, "从常用列表移除当前 Mesh 文件夹，不会删除本地文件。")
+        self._set_tip(self.mesh_recursive_checkbox, "勾选后扫描当前文件夹及其所有子文件夹。")
+        self._set_tip(self.mesh_keep_case_checkbox, "勾选后读取 Mesh 会走 Fluent 的 replace-mesh，保留当前 Case 设置并替换 Mesh/Data。")
+        self._set_tip(self.show_hidden_mesh_checkbox, "显示已经标记隐藏的 Mesh。隐藏只影响列表显示，不会删除文件。")
+        self._set_tip(self.mesh_filter_edit, "按文件名或路径过滤已扫描到的 Mesh。多个关键词用空格分隔。")
+        self._set_tip(self.hide_selected_mesh_btn, "把选中的 Mesh 标记为隐藏，默认扫描列表不再显示它。")
+        self._set_tip(self.unhide_selected_mesh_btn, "取消选中 Mesh 的隐藏标记。")
+        self._set_tip(self.refresh_mesh_files_btn, "扫描当前 Mesh 文件夹中的 .msh 文件。")
+        self._set_tip(self.refresh_all_mesh_files_btn, "扫描全部常用 Mesh 文件夹，并汇总到下面的列表。")
+        self._set_tip(self.read_selected_mesh_btn, "读取列表中选中的 Mesh 文件。双击列表行也会读取。")
+        self._set_tip(self.mesh_file_table, "显示 .msh/.msh.gz/.msh.h5 文件。点击表头可以按路径、修改时间或大小排序。")
 
         self._set_tip(self.udf_dir_edit, "包含 UDF .c/.h/.hpp 源码的文件夹。扫描时会跳过 libudf 等生成目录。")
         self._set_tip(self.browse_udf_btn, "选择 UDF 源码文件夹。")
@@ -6057,6 +6241,18 @@ class MainWindow(QMainWindow):
         self._set_tip(self.save_sweep_grid_btn, "保存当前参数网格，并刷新组合列表。")
         self._set_tip(self.preview_sweep_combos_btn, "根据当前参数网格重新生成笛卡尔积组合。")
         self._set_tip(self.sweep_grid_editor, "每行一个 rpvar，例如 udf/a-ent = 5e-13, 1e-12。")
+        self._set_tip(self.sweep_launch_work_dir_edit, "参数扫描自动启动 Fluent 时使用的工作目录；和启动页工作目录保持同步。")
+        self._set_tip(self.browse_sweep_launch_work_btn, "选择参数扫描启动 Fluent 时使用的工作目录。")
+        self._set_tip(self.open_sweep_launch_work_btn, "在资源管理器中打开参数扫描启动工作目录。")
+        self._set_tip(self.sweep_launch_dim_combo, "参数扫描自动启动 Fluent 时使用的求解器维度。")
+        self._set_tip(self.sweep_launch_cores_spin, "参数扫描自动启动 Fluent 时使用的本地处理器数量。")
+        self._set_tip(self.sweep_launch_gui_checkbox, "勾选后参数扫描自动启动 Fluent 时显示 GUI。")
+        self._set_tip(self.sweep_launch_load_scm_on_start_checkbox, "勾选后参数扫描自动启动 Fluent 完成后加载 SCM 文件。")
+        self._set_tip(self.sweep_launch_scm_file_edit, "参数扫描自动启动 Fluent 后加载的 Scheme/SCM 脚本路径。")
+        self._set_tip(self.browse_sweep_launch_scm_btn, "选择参数扫描启动后加载的 SCM 文件。")
+        self._set_tip(self.open_sweep_launch_scm_btn, "在资源管理器中打开参数扫描启动 SCM 文件所在文件夹。")
+        self._set_tip(self.clear_sweep_launch_scm_btn, "清空启动 SCM 路径，不会删除本地文件。")
+        self._set_tip(self.sweep_launch_status_label, "当前 Fluent 会话状态。已启动时扫描会复用当前会话，不再读取这里的启动参数。")
         self._set_tip(self.sweep_scan_dir_edit, "扫描批处理的根目录。每个组合会在这里创建一个独立文件夹。")
         self._set_tip(self.browse_sweep_scan_dir_btn, "选择扫描批处理根目录。")
         self._set_tip(self.open_sweep_scan_dir_btn, "在资源管理器中打开扫描工作目录。")
@@ -6906,6 +7102,7 @@ class MainWindow(QMainWindow):
                 padding: 10px;
             }
             QTableWidget#sweepComboTable,
+            QTableWidget#meshFileTable,
             QListWidget#postImageList,
             QListWidget#workflowStepList,
             QTextEdit#postResultText {
@@ -6964,9 +7161,54 @@ class MainWindow(QMainWindow):
         self.open_launch_scm_btn.clicked.connect(lambda: self._open_path_location(self.launch_scm_file_edit, "SCM 文件"))
         self.clear_launch_scm_btn.clicked.connect(lambda: self._set_scm_path(""))
         self.load_scm_on_start_checkbox.toggled.connect(lambda _: self._update_enabled_state())
+        self.work_dir_edit.editTextChanged.connect(
+            lambda text: self._sync_combo_text(self.sweep_launch_work_dir_edit, text)
+        )
+        self.sweep_launch_work_dir_edit.editTextChanged.connect(
+            lambda text: self._sync_combo_text(self.work_dir_edit, text)
+        )
+        self.dim_combo.currentTextChanged.connect(
+            lambda text: self._sync_combo_text(self.sweep_launch_dim_combo, text)
+        )
+        self.sweep_launch_dim_combo.currentTextChanged.connect(
+            lambda text: self._sync_combo_text(self.dim_combo, text)
+        )
+        self.cores_spin.valueChanged.connect(
+            lambda value: self._sync_spin_value(self.sweep_launch_cores_spin, value)
+        )
+        self.sweep_launch_cores_spin.valueChanged.connect(
+            lambda value: self._sync_spin_value(self.cores_spin, value)
+        )
+        self.gui_checkbox.toggled.connect(
+            lambda checked: self._sync_check_value(self.sweep_launch_gui_checkbox, checked)
+        )
+        self.sweep_launch_gui_checkbox.toggled.connect(
+            lambda checked: self._sync_check_value(self.gui_checkbox, checked)
+        )
+        self.load_scm_on_start_checkbox.toggled.connect(
+            lambda checked: self._sync_check_value(self.sweep_launch_load_scm_on_start_checkbox, checked)
+        )
+        self.sweep_launch_load_scm_on_start_checkbox.toggled.connect(
+            lambda checked: self._sync_check_value(self.load_scm_on_start_checkbox, checked)
+        )
+        self.launch_scm_file_edit.editTextChanged.connect(
+            lambda text: self._sync_combo_text(self.sweep_launch_scm_file_edit, text)
+        )
+        self.sweep_launch_scm_file_edit.editTextChanged.connect(
+            lambda text: self._sync_combo_text(self.launch_scm_file_edit, text)
+        )
+        self.browse_sweep_launch_work_btn.clicked.connect(self._browse_sweep_launch_work_dir)
+        self.open_sweep_launch_work_btn.clicked.connect(
+            lambda: self._open_path_location(self.sweep_launch_work_dir_edit, "工作目录")
+        )
+        self.browse_sweep_launch_scm_btn.clicked.connect(lambda: self._browse_scm_file(self.sweep_launch_scm_file_edit))
+        self.open_sweep_launch_scm_btn.clicked.connect(
+            lambda: self._open_path_location(self.sweep_launch_scm_file_edit, "SCM 文件")
+        )
+        self.clear_sweep_launch_scm_btn.clicked.connect(lambda: self._set_scm_path(""))
         self.browse_file_btn.clicked.connect(self._browse_file_open)
         self.save_file_btn.clicked.connect(self._browse_file_save)
-        self.open_file_btn.clicked.connect(lambda: self._open_path_location(self.file_path_edit, "Case/Data 路径"))
+        self.open_file_btn.clicked.connect(lambda: self._open_path_location(self.file_path_edit, "Case/Data/Mesh 路径"))
         self.file_use_case_btn.clicked.connect(self._use_case_path_for_file)
         self.file_use_work_btn.clicked.connect(self._use_work_dir_for_file)
         self.browse_udf_btn.clicked.connect(self._browse_udf_dir)
@@ -6982,9 +7224,28 @@ class MainWindow(QMainWindow):
         self.stop_btn.clicked.connect(self._stop_fluent)
         self.read_case_btn.clicked.connect(self._read_case)
         self.read_data_btn.clicked.connect(self._read_data)
+        self.read_mesh_btn.clicked.connect(self._read_mesh)
         self.write_case_btn.clicked.connect(self._write_case)
         self.write_data_btn.clicked.connect(self._write_data)
         self.write_case_data_btn.clicked.connect(self._write_case_data)
+        self.browse_mesh_folder_btn.clicked.connect(self._browse_mesh_folder)
+        self.open_mesh_folder_btn.clicked.connect(lambda: self._open_path_location(self.mesh_folder_edit, "Mesh 文件夹"))
+        self.add_mesh_folder_btn.clicked.connect(self._add_mesh_folder)
+        self.remove_mesh_folder_btn.clicked.connect(self._remove_mesh_folder)
+        self.mesh_recursive_checkbox.toggled.connect(lambda checked: self.settings.setValue("mesh_recursive", checked))
+        self.mesh_keep_case_checkbox.toggled.connect(
+            lambda checked: self.settings.setValue("mesh_keep_case_on_read", checked)
+        )
+        self.show_hidden_mesh_checkbox.toggled.connect(self._set_show_hidden_mesh)
+        self.mesh_filter_edit.textChanged.connect(lambda _text: self._populate_mesh_table())
+        self.hide_selected_mesh_btn.clicked.connect(self._hide_selected_mesh)
+        self.unhide_selected_mesh_btn.clicked.connect(self._unhide_selected_mesh)
+        self.refresh_mesh_files_btn.clicked.connect(lambda _checked=False: self._refresh_mesh_files(False))
+        self.refresh_all_mesh_files_btn.clicked.connect(lambda _checked=False: self._refresh_mesh_files(True))
+        self.read_selected_mesh_btn.clicked.connect(self._read_selected_mesh)
+        self.mesh_file_table.currentCellChanged.connect(lambda *_args: self._use_selected_mesh_file())
+        self.mesh_file_table.itemSelectionChanged.connect(self._update_enabled_state)
+        self.mesh_file_table.itemDoubleClicked.connect(lambda _item: self._read_selected_mesh())
         self.build_udf_btn.clicked.connect(self._build_udf)
         self.execute_on_demand_btn.clicked.connect(self._execute_on_demand)
         self.use_preset_btn.clicked.connect(self._use_preset_command)
@@ -7061,6 +7322,7 @@ class MainWindow(QMainWindow):
         self.app_signals.sweep_progress.connect(self._set_sweep_progress)
         self.window_signals.task_finished.connect(self._task_finished)
         self.window_signals.interrupt_finished.connect(self._interrupt_finished)
+        self.window_signals.mesh_files_scanned.connect(self._mesh_files_scanned)
         self.window_signals.post_image_ready.connect(self._open_post_image_window)
         self.window_signals.post_results_scanned.connect(self._post_results_scanned)
         self.window_signals.post_objects_loaded.connect(self._post_objects_loaded)
@@ -7070,10 +7332,20 @@ class MainWindow(QMainWindow):
     def _restore_settings(self) -> None:
         default_work = DEFAULT_WORK_DIR if DEFAULT_WORK_DIR.exists() else TOOL_ROOT
         self._restore_combo("work_dir", self.work_dir_edit, str(default_work))
+        self._restore_combo("work_dir", self.sweep_launch_work_dir_edit, combo_text(self.work_dir_edit))
         self._restore_combo("case_file", self.case_file_edit, "")
         self._restore_combo("file_path", self.file_path_edit, "")
+        self._restore_mesh_folders()
+        self.mesh_recursive_checkbox.setChecked(coerce_bool(self.settings.value("mesh_recursive", True), True))
+        self.mesh_keep_case_checkbox.setChecked(
+            coerce_bool(self.settings.value("mesh_keep_case_on_read", True), True)
+        )
+        self.show_hidden_mesh_checkbox.setChecked(
+            coerce_bool(self.settings.value("mesh_show_hidden", False), False)
+        )
         self._restore_combo("udf_dir", self.udf_dir_edit, "")
         self._restore_combo("scm_file", self.launch_scm_file_edit, "")
+        self._restore_combo("scm_file", self.sweep_launch_scm_file_edit, combo_text(self.launch_scm_file_edit))
         self._restore_combo("scm_file", self.command_scm_file_edit, combo_text(self.launch_scm_file_edit))
         self._restore_combo("post_output_dir", self.post_output_dir_edit, "")
         self._restore_combo("post_command", self.post_command_edit, "")
@@ -7101,6 +7373,7 @@ class MainWindow(QMainWindow):
         self.load_scm_on_start_checkbox.setChecked(
             coerce_bool(self.settings.value("load_scm_on_start", False), False)
         )
+        self._sync_sweep_launch_controls_from_launch()
         self.output_visible_checkbox.setChecked(coerce_bool(self.settings.value("output_visible", True), True))
         self.output_below_checkbox.setChecked(coerce_bool(self.settings.value("output_below", False), False))
         self._apply_output_layout()
@@ -7111,6 +7384,7 @@ class MainWindow(QMainWindow):
         if not combo_text(self.post_output_dir_edit):
             set_combo_text(self.post_output_dir_edit, str(self._default_post_dir()))
         self._restore_plot_buttons()
+        self._refresh_mesh_files(show_errors=False)
         self._refresh_post_results()
         tab_index = safe_int(self.settings.value("current_tab", 0), 0, minimum=0)
         if 0 <= tab_index < self.action_tabs.count():
@@ -7129,6 +7403,29 @@ class MainWindow(QMainWindow):
         self.settings.setValue(key, current)
         items = remember_history(self.settings, key, current)
         populate_combo(combo, items, current)
+        return current
+
+    def _restore_mesh_folders(self) -> None:
+        default = str(DEFAULT_MESH_DIR)
+        current = clean_entry(str(self.settings.value("mesh_folder", default) or default))
+        items = read_history(self.settings, "mesh_folder")
+        seen = {item.lower() for item in items}
+        for item in (current, default):
+            if item and item.lower() not in seen:
+                items.insert(0, item)
+                seen.add(item.lower())
+        populate_combo(self.mesh_folder_edit, items[:HISTORY_LIMIT], current)
+
+    def _remember_mesh_folder(self, value: str = "") -> str:
+        current = clean_entry(value or combo_text(self.mesh_folder_edit))
+        if current:
+            set_combo_text(self.mesh_folder_edit, current)
+        self.settings.setValue("mesh_folder", current)
+        items = remember_history(self.settings, "mesh_folder", current)
+        default = str(DEFAULT_MESH_DIR)
+        if default.lower() not in {item.lower() for item in items}:
+            items.append(default)
+        populate_combo(self.mesh_folder_edit, items[:HISTORY_LIMIT], current)
         return current
 
     def _restore_command_text_combo(self) -> None:
@@ -7160,6 +7457,49 @@ class MainWindow(QMainWindow):
                 existing.add(text.lower())
         combo.setCurrentText(current)
         combo.blockSignals(False)
+
+    def _sync_combo_text(self, target: QComboBox, value: str) -> None:
+        if self._syncing_launch_controls:
+            return
+        self._syncing_launch_controls = True
+        try:
+            set_combo_text(target, value)
+        finally:
+            self._syncing_launch_controls = False
+
+    def _sync_spin_value(self, target: QSpinBox, value: int) -> None:
+        if self._syncing_launch_controls:
+            return
+        self._syncing_launch_controls = True
+        try:
+            target.setValue(value)
+        finally:
+            self._syncing_launch_controls = False
+
+    def _sync_check_value(self, target: QCheckBox, checked: bool) -> None:
+        if self._syncing_launch_controls:
+            return
+        self._syncing_launch_controls = True
+        try:
+            target.setChecked(checked)
+        finally:
+            self._syncing_launch_controls = False
+        self._update_enabled_state()
+
+    def _sync_sweep_launch_controls_from_launch(self) -> None:
+        self._syncing_launch_controls = True
+        try:
+            set_combo_text(self.sweep_launch_work_dir_edit, combo_text(self.work_dir_edit))
+            self.sweep_launch_dim_combo.setCurrentText(self.dim_combo.currentText())
+            self.sweep_launch_cores_spin.setValue(self.cores_spin.value())
+            self.sweep_launch_gui_checkbox.setChecked(self.gui_checkbox.isChecked())
+            self.sweep_launch_load_scm_on_start_checkbox.setChecked(
+                self.load_scm_on_start_checkbox.isChecked()
+            )
+            set_combo_text(self.sweep_launch_scm_file_edit, combo_text(self.launch_scm_file_edit))
+        finally:
+            self._syncing_launch_controls = False
+        self._update_enabled_state()
 
     def _apply_output_layout(self) -> None:
         visible = self.output_visible_checkbox.isChecked()
@@ -8559,7 +8899,7 @@ class MainWindow(QMainWindow):
     def _sweep_launch_config(self) -> dict[str, Any]:
         scan_dir = combo_text(self.sweep_scan_dir_edit)
         base_case = combo_text(self.sweep_base_case_edit)
-        work_dir = combo_text(self.work_dir_edit)
+        work_dir = combo_text(self.sweep_launch_work_dir_edit)
         if not work_dir:
             work_dir = scan_dir
         if not work_dir and base_case:
@@ -8570,15 +8910,15 @@ class MainWindow(QMainWindow):
             Path(work_dir).expanduser().mkdir(parents=True, exist_ok=True)
         case_file = base_case or combo_text(self.case_file_edit)
         scm_file = self._selected_scm_path(prefer_launch=True)
-        if self.load_scm_on_start_checkbox.isChecked() and not scm_file:
+        if self.sweep_launch_load_scm_on_start_checkbox.isChecked() and not scm_file:
             raise ValueError("已勾选启动后加载 SCM，请先选择或输入 SCM 文件。")
         return {
             "work_dir": work_dir,
             "case_file": case_file,
-            "dimension_text": self.dim_combo.currentText(),
-            "processor_count": self.cores_spin.value(),
-            "show_gui": self.gui_checkbox.isChecked(),
-            "load_scm_on_start": self.load_scm_on_start_checkbox.isChecked(),
+            "dimension_text": self.sweep_launch_dim_combo.currentText(),
+            "processor_count": self.sweep_launch_cores_spin.value(),
+            "show_gui": self.sweep_launch_gui_checkbox.isChecked(),
+            "load_scm_on_start": self.sweep_launch_load_scm_on_start_checkbox.isChecked(),
             "scm_file": scm_file,
         }
 
@@ -8768,6 +9108,10 @@ class MainWindow(QMainWindow):
         self._remember_combo("work_dir", self.work_dir_edit)
         self._remember_combo("case_file", self.case_file_edit)
         self._remember_combo("file_path", self.file_path_edit)
+        self._remember_mesh_folder()
+        self.settings.setValue("mesh_recursive", self.mesh_recursive_checkbox.isChecked())
+        self.settings.setValue("mesh_keep_case_on_read", self.mesh_keep_case_checkbox.isChecked())
+        self.settings.setValue("mesh_show_hidden", self.show_hidden_mesh_checkbox.isChecked())
         self._remember_combo("udf_dir", self.udf_dir_edit)
         self._remember_combo("post_output_dir", self.post_output_dir_edit)
         self._remember_combo("init_zone_type", self.init_zone_type_edit)
@@ -8807,12 +9151,21 @@ class MainWindow(QMainWindow):
 
     def _selected_scm_path(self, prefer_launch: bool = False) -> str:
         if prefer_launch:
-            return combo_text(self.launch_scm_file_edit) or combo_text(self.command_scm_file_edit)
-        return combo_text(self.command_scm_file_edit) or combo_text(self.launch_scm_file_edit)
+            return (
+                combo_text(self.sweep_launch_scm_file_edit)
+                or combo_text(self.launch_scm_file_edit)
+                or combo_text(self.command_scm_file_edit)
+            )
+        return (
+            combo_text(self.command_scm_file_edit)
+            or combo_text(self.launch_scm_file_edit)
+            or combo_text(self.sweep_launch_scm_file_edit)
+        )
 
     def _set_scm_path(self, path: str | Path) -> None:
         value = str(path or "")
         set_combo_text(self.launch_scm_file_edit, value)
+        set_combo_text(self.sweep_launch_scm_file_edit, value)
         set_combo_text(self.command_scm_file_edit, value)
 
     def _remember_scm_path(self, path: str = "") -> str:
@@ -8820,8 +9173,359 @@ class MainWindow(QMainWindow):
         self.settings.setValue("scm_file", current)
         items = remember_history(self.settings, "scm_file", current)
         populate_combo(self.launch_scm_file_edit, items, current)
+        populate_combo(self.sweep_launch_scm_file_edit, items, current)
         populate_combo(self.command_scm_file_edit, items, current)
         return current
+
+    def _mesh_path_key(self, path_text: str | Path) -> str:
+        text = clean_entry(str(path_text))
+        if not text:
+            return ""
+        return str(Path(text).expanduser().resolve()).lower()
+
+    def _read_hidden_mesh_paths(self) -> set[str]:
+        raw = self.settings.value("mesh_hidden_paths", [])
+        values: list[str] = []
+        if isinstance(raw, (list, tuple)):
+            values = [clean_entry(str(item)) for item in raw]
+        elif raw:
+            text = str(raw)
+            with contextlib.suppress(Exception):
+                decoded = json.loads(text)
+                if isinstance(decoded, list):
+                    values = [clean_entry(str(item)) for item in decoded]
+            if not values:
+                values = [clean_entry(item) for item in text.splitlines()]
+        return {self._mesh_path_key(value) for value in values if self._mesh_path_key(value)}
+
+    def _write_hidden_mesh_paths(self, hidden: set[str]) -> None:
+        self.settings.setValue("mesh_hidden_paths", sorted(value for value in hidden if value))
+
+    def _is_mesh_hidden(self, path_text: str | Path) -> bool:
+        key = self._mesh_path_key(path_text)
+        return bool(key and key in self._read_hidden_mesh_paths())
+
+    def _set_show_hidden_mesh(self, checked: bool) -> None:
+        self.settings.setValue("mesh_show_hidden", bool(checked))
+        self._populate_mesh_table()
+
+    def _mesh_filter_terms(self) -> list[str]:
+        return [
+            term.lower()
+            for term in clean_entry(self.mesh_filter_edit.text()).split()
+            if term
+        ]
+
+    def _mesh_folder_texts(self) -> list[str]:
+        values: list[str] = []
+        seen: set[str] = set()
+        for value in [combo_text(self.mesh_folder_edit)] + [
+            self.mesh_folder_edit.itemText(index) for index in range(self.mesh_folder_edit.count())
+        ]:
+            text = clean_entry(value)
+            key = text.lower()
+            if text and key not in seen:
+                values.append(text)
+                seen.add(key)
+        return values
+
+    def _mesh_scan_folders(self, all_folders: bool = False) -> list[Path]:
+        texts = self._mesh_folder_texts() if all_folders else [combo_text(self.mesh_folder_edit)]
+        folders: list[Path] = []
+        seen: set[str] = set()
+        for text in texts:
+            if not text:
+                continue
+            path = Path(text).expanduser().resolve()
+            key = str(path).lower()
+            if key not in seen:
+                folders.append(path)
+                seen.add(key)
+        return folders
+
+    def _browse_mesh_folder(self) -> None:
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "选择 Mesh 文件夹",
+            dialog_start_path(combo_text(self.mesh_folder_edit), combo_text(self.work_dir_edit)),
+        )
+        if directory:
+            self._remember_mesh_folder(directory)
+            self._refresh_mesh_files()
+
+    def _add_mesh_folder(self) -> None:
+        text = combo_text(self.mesh_folder_edit)
+        if not text:
+            QMessageBox.information(self, "没有文件夹", "请先选择或输入 Mesh 文件夹。")
+            return
+        path = Path(text).expanduser().resolve()
+        if not path.exists() or not path.is_dir():
+            QMessageBox.warning(self, "文件夹不可用", f"Mesh 文件夹不存在：{path}")
+            return
+        self._remember_mesh_folder(str(path))
+        self._refresh_mesh_files()
+
+    def _remove_mesh_folder(self) -> None:
+        current = combo_text(self.mesh_folder_edit)
+        if not current:
+            return
+        items = [
+            item for item in read_history(self.settings, "mesh_folder")
+            if item.lower() != current.lower()
+        ]
+        self.settings.setValue("history/mesh_folder", items)
+        next_current = items[0] if items else ""
+        self.settings.setValue("mesh_folder", next_current)
+        populate_combo(self.mesh_folder_edit, items, next_current)
+        self._refresh_mesh_files(show_errors=False)
+
+    def _scan_mesh_file_records(self, folders: list[Path], recursive: bool) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for folder in folders:
+            try:
+                children = folder.rglob("*") if recursive else folder.iterdir()
+            except OSError:
+                continue
+            for path in children:
+                try:
+                    if not path.is_file() or not is_mesh_file_path(path):
+                        continue
+                    resolved = path.resolve()
+                    key = str(resolved).lower()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    stat = resolved.stat()
+                    records.append(
+                        {
+                            "name": resolved.name,
+                            "path": str(resolved),
+                            "mtime": float(stat.st_mtime),
+                            "size": int(stat.st_size),
+                        }
+                    )
+                except OSError:
+                    continue
+        records.sort(key=lambda item: (float(item["mtime"]), str(item["path"]).lower()), reverse=True)
+        return records
+
+    def _refresh_mesh_files(self, all_folders: bool = False, show_errors: bool = True) -> None:
+        try:
+            folders = self._mesh_scan_folders(all_folders)
+            if not folders:
+                raise ValueError("请先选择或输入 Mesh 文件夹。")
+            valid_folders = [path for path in folders if path.exists() and path.is_dir()]
+            if not valid_folders:
+                raise FileNotFoundError("Mesh 文件夹不存在：" + "；".join(str(path) for path in folders))
+        except Exception as error:
+            self.mesh_file_records = []
+            self.mesh_file_paths = []
+            self.mesh_file_table.setRowCount(0)
+            self.mesh_files_label.setText("Mesh 文件夹不可用")
+            if show_errors:
+                QMessageBox.warning(self, "Mesh 文件夹不可用", f"{type(error).__name__}: {error}")
+            self._update_enabled_state()
+            return
+
+        self.mesh_scan_token += 1
+        token = self.mesh_scan_token
+        label = f"全部常用 Mesh 文件夹（{len(valid_folders)} 个）" if all_folders else str(valid_folders[0])
+        self.mesh_refresh_active = True
+        self.refresh_mesh_files_btn.setText("扫描中...")
+        self.mesh_files_label.setText(f"正在扫描：{label}")
+        self._update_enabled_state()
+        try:
+            future = self.io_executor.submit(
+                self._scan_mesh_file_records,
+                valid_folders,
+                self.mesh_recursive_checkbox.isChecked(),
+            )
+        except Exception:
+            self.mesh_refresh_active = False
+            self.refresh_mesh_files_btn.setText("扫描当前")
+            self.mesh_files_label.setText("Mesh 扫描提交失败")
+            self._queue_console_text(f"[{now_text()}] Mesh 扫描任务提交失败：\n{traceback.format_exc()}\n")
+            self._update_enabled_state()
+            return
+        future.add_done_callback(
+            lambda fut, scan_token=token, scan_label=label: self._on_mesh_files_scan_done(
+                scan_token,
+                scan_label,
+                fut,
+            )
+        )
+
+    def _on_mesh_files_scan_done(self, token: int, label: str, future: Future) -> None:
+        error = ""
+        records: list[dict[str, Any]] = []
+        try:
+            records = list(future.result())
+        except Exception:
+            error = traceback.format_exc()
+        with contextlib.suppress(RuntimeError):
+            self.window_signals.mesh_files_scanned.emit(token, label, records, error)
+
+    def _mesh_files_scanned(self, token: int, label: str, records: list, error: str) -> None:
+        if token != self.mesh_scan_token:
+            return
+        self.mesh_refresh_active = False
+        self.refresh_mesh_files_btn.setText("扫描当前")
+        if error:
+            self.mesh_file_records = []
+            self.mesh_file_paths = []
+            self.mesh_file_table.setRowCount(0)
+            self.mesh_files_label.setText(f"Mesh 扫描失败：{label}")
+            self._queue_console_text(f"[{now_text()}] Mesh 文件夹扫描失败：\n{error}\n")
+            self._update_enabled_state()
+            return
+
+        self.mesh_scan_label = label
+        self.mesh_file_records = list(records)
+        self._populate_mesh_table()
+
+    def _populate_mesh_table(self) -> None:
+        label = self.mesh_scan_label or combo_text(self.mesh_folder_edit) or "Mesh"
+        previous_path = self._selected_mesh_file_path()
+        path_to_select = previous_path
+        hidden_paths = self._read_hidden_mesh_paths()
+        show_hidden = self.show_hidden_mesh_checkbox.isChecked()
+        filter_terms = self._mesh_filter_terms()
+        visible_records: list[dict[str, Any]] = []
+        hidden_count = 0
+        filtered_count = 0
+        for record in self.mesh_file_records:
+            path_text = str(record.get("path", ""))
+            is_hidden = self._mesh_path_key(path_text) in hidden_paths
+            if is_hidden:
+                hidden_count += 1
+                if not show_hidden:
+                    continue
+            name = str(record.get("name", Path(path_text).name))
+            if filter_terms:
+                haystack = f"{name} {path_text}".lower()
+                if not all(term in haystack for term in filter_terms):
+                    filtered_count += 1
+                    continue
+            next_record = dict(record)
+            next_record["hidden"] = is_hidden
+            visible_records.append(next_record)
+
+        self.mesh_file_paths = [Path(str(record.get("path", ""))) for record in visible_records if record.get("path")]
+        self._updating_mesh_table = True
+        try:
+            self.mesh_file_table.setSortingEnabled(False)
+            self.mesh_file_table.setRowCount(len(visible_records))
+            for row, record in enumerate(visible_records):
+                path_text = str(record.get("path", ""))
+                name = str(record.get("name", Path(path_text).name))
+                mtime = float(record.get("mtime", 0.0) or 0.0)
+                size = int(record.get("size", 0) or 0)
+                is_hidden = bool(record.get("hidden", False))
+                modified = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S") if mtime else ""
+
+                values = [
+                    (name, name.lower()),
+                    (path_text, path_text.lower()),
+                    (modified, mtime),
+                    (format_file_size(size), size),
+                    ("隐藏" if is_hidden else "", 1 if is_hidden else 0),
+                ]
+                for column, (text, sort_value) in enumerate(values):
+                    item = SortableTableItem(str(text))
+                    item.setToolTip(path_text)
+                    item.setData(Qt.ItemDataRole.UserRole, path_text)
+                    item.setData(COMBO_SORT_ROLE, sort_value)
+                    if is_hidden:
+                        item.setForeground(QColor("#94a3b8"))
+                    self.mesh_file_table.setItem(row, column, item)
+                if not path_to_select:
+                    path_to_select = path_text
+            self.mesh_file_table.setSortingEnabled(True)
+            self.mesh_file_table.sortItems(2, Qt.SortOrder.DescendingOrder)
+            selected = False
+            if path_to_select:
+                for row in range(self.mesh_file_table.rowCount()):
+                    item = self.mesh_file_table.item(row, 1) or self.mesh_file_table.item(row, 0)
+                    if item is not None and clean_entry(str(item.data(Qt.ItemDataRole.UserRole))) == path_to_select:
+                        self.mesh_file_table.selectRow(row)
+                        selected = True
+                        break
+            if not selected and self.mesh_file_table.rowCount() > 0:
+                self.mesh_file_table.selectRow(0)
+        finally:
+            self._updating_mesh_table = False
+        selected_path = self._selected_mesh_file_path()
+        if selected_path:
+            set_combo_text(self.file_path_edit, selected_path)
+        details: list[str] = []
+        if filter_terms:
+            details.append(f"过滤掉 {filtered_count} 个")
+        if hidden_count and not show_hidden:
+            details.append(f"隐藏 {hidden_count} 个")
+        elif hidden_count:
+            details.append(f"其中隐藏 {hidden_count} 个")
+        suffix = f"Mesh {len(visible_records)} 个"
+        if details:
+            suffix += "，" + "，".join(details)
+        self.mesh_files_label.setText(f"{label}    {suffix}")
+        self._update_enabled_state()
+
+    def _selected_mesh_file_path(self) -> str:
+        row = self.mesh_file_table.currentRow()
+        if row < 0:
+            selected = self.mesh_file_table.selectedItems()
+            if selected:
+                row = selected[0].row()
+        if row < 0:
+            return ""
+        item = self.mesh_file_table.item(row, 1) or self.mesh_file_table.item(row, 0)
+        return clean_entry(str(item.data(Qt.ItemDataRole.UserRole) if item is not None else ""))
+
+    def _use_selected_mesh_file(self) -> None:
+        if self._updating_mesh_table:
+            return
+        path = self._selected_mesh_file_path()
+        if path:
+            set_combo_text(self.file_path_edit, path)
+        self._update_enabled_state()
+
+    def _read_selected_mesh(self) -> None:
+        path = self._selected_mesh_file_path()
+        if not path:
+            QMessageBox.information(self, "没有 Mesh", "请先在列表中选择一个 Mesh 文件。")
+            return
+        set_combo_text(self.file_path_edit, path)
+        self._submit_file_action(
+            "读取 Mesh",
+            self.controller.read_mesh,
+            path,
+            self.mesh_keep_case_checkbox.isChecked(),
+        )
+
+    def _hide_selected_mesh(self) -> None:
+        path = self._selected_mesh_file_path()
+        if not path:
+            QMessageBox.information(self, "没有 Mesh", "请先在列表中选择一个 Mesh 文件。")
+            return
+        hidden = self._read_hidden_mesh_paths()
+        key = self._mesh_path_key(path)
+        if key:
+            hidden.add(key)
+            self._write_hidden_mesh_paths(hidden)
+        self._populate_mesh_table()
+
+    def _unhide_selected_mesh(self) -> None:
+        path = self._selected_mesh_file_path()
+        if not path:
+            QMessageBox.information(self, "没有 Mesh", "请先在列表中选择一个 Mesh 文件。")
+            return
+        hidden = self._read_hidden_mesh_paths()
+        key = self._mesh_path_key(path)
+        if key and key in hidden:
+            hidden.remove(key)
+            self._write_hidden_mesh_paths(hidden)
+        self._populate_mesh_table()
 
     def _default_post_dir(self) -> Path:
         if self.controller.work_dir is not None:
@@ -9197,6 +9901,22 @@ class MainWindow(QMainWindow):
             set_combo_text(self.work_dir_edit, directory)
             self._remember_combo("work_dir", self.work_dir_edit)
 
+    def _browse_sweep_launch_work_dir(self) -> None:
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "选择参数扫描启动工作目录",
+            dialog_start_path(
+                combo_text(self.sweep_launch_work_dir_edit),
+                combo_text(self.work_dir_edit),
+                combo_text(self.sweep_scan_dir_edit),
+            ),
+        )
+        if directory:
+            set_combo_text(self.sweep_launch_work_dir_edit, directory)
+            set_combo_text(self.work_dir_edit, directory)
+            self._remember_combo("work_dir", self.sweep_launch_work_dir_edit)
+            self._remember_combo("work_dir", self.work_dir_edit)
+
     def _browse_case_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self,
@@ -9216,7 +9936,10 @@ class MainWindow(QMainWindow):
             "选择 SCM 文件",
             dialog_start_path(
                 combo_text(target_combo),
-                self._selected_scm_path(prefer_launch=target_combo is self.launch_scm_file_edit),
+                self._selected_scm_path(
+                    prefer_launch=target_combo is self.launch_scm_file_edit
+                    or target_combo is self.sweep_launch_scm_file_edit
+                ),
                 combo_text(self.work_dir_edit),
             ),
             "Fluent Scheme (*.scm);;All Files (*)",
@@ -9228,9 +9951,9 @@ class MainWindow(QMainWindow):
     def _browse_file_open(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "选择 Case/Data 文件",
+            "选择 Case/Data/Mesh 文件",
             dialog_start_path(combo_text(self.file_path_edit), combo_text(self.case_file_edit), combo_text(self.work_dir_edit)),
-            "Fluent Case/Data (*.cas *.cas.h5 *.cas.gz *.cas.h5.gz *.dat *.dat.h5 *.dat.gz *.dat.h5.gz);;All Files (*)",
+            "Fluent Case/Data/Mesh (*.cas *.cas.h5 *.cas.gz *.cas.h5.gz *.dat *.dat.h5 *.dat.gz *.dat.h5.gz *.msh *.msh.gz *.msh.h5 *.msh.h5.gz);;All Files (*)",
         )
         if path:
             set_combo_text(self.file_path_edit, path)
@@ -9547,7 +10270,7 @@ class MainWindow(QMainWindow):
                 set_combo_text(self.file_path_edit, path)
         return path
 
-    def _submit_file_action(self, label: str, func: Callable[[str], None], path: str) -> None:
+    def _submit_file_action(self, label: str, func: Callable[..., None], path: str, *args: Any) -> None:
         if not self.controller.has_session:
             QMessageBox.warning(self, "Fluent 未启动", f"请先启动 Fluent，再{label}。")
             return
@@ -9555,7 +10278,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "缺少路径", "请先选择或输入文件路径。")
             return
         self._remember_combo("file_path", self.file_path_edit)
-        self._submit(label, func, path)
+        self._submit(label, func, path, *args)
 
     def _read_case(self) -> None:
         path = self._selected_file_path(self.case_file_edit)
@@ -9566,6 +10289,19 @@ class MainWindow(QMainWindow):
 
     def _read_data(self) -> None:
         self._submit_file_action("读取 Data", self.controller.read_data, self._selected_file_path())
+
+    def _read_mesh(self) -> None:
+        path = self._selected_file_path()
+        if not path:
+            path = self._selected_mesh_file_path()
+            if path:
+                set_combo_text(self.file_path_edit, path)
+        self._submit_file_action(
+            "读取 Mesh",
+            self.controller.read_mesh,
+            path,
+            self.mesh_keep_case_checkbox.isChecked(),
+        )
 
     def _write_case(self) -> None:
         if not combo_text(self.file_path_edit):
@@ -10293,6 +11029,30 @@ class MainWindow(QMainWindow):
         self.sweep_base_case_edit.setEnabled(not self.busy and not scan_running)
         self.browse_sweep_base_case_btn.setEnabled(not self.busy and not scan_running)
         self.open_sweep_base_case_btn.setEnabled(not self.busy)
+        sweep_launch_enabled = not self.busy and not scan_running and not has_session
+        sweep_launch_scm_enabled = (
+            sweep_launch_enabled and self.sweep_launch_load_scm_on_start_checkbox.isChecked()
+        )
+        self.sweep_launch_status_label.setText(
+            "当前会话：已启动，参数已锁定" if has_session else "当前会话：未启动"
+        )
+        for widget in (
+            self.sweep_launch_work_dir_edit,
+            self.browse_sweep_launch_work_btn,
+            self.sweep_launch_dim_combo,
+            self.sweep_launch_cores_spin,
+            self.sweep_launch_gui_checkbox,
+            self.sweep_launch_load_scm_on_start_checkbox,
+        ):
+            widget.setEnabled(sweep_launch_enabled)
+        self.open_sweep_launch_work_btn.setEnabled(not self.busy)
+        for widget in (
+            self.sweep_launch_scm_file_edit,
+            self.browse_sweep_launch_scm_btn,
+            self.clear_sweep_launch_scm_btn,
+        ):
+            widget.setEnabled(sweep_launch_scm_enabled)
+        self.open_sweep_launch_scm_btn.setEnabled(not self.busy)
         self.sweep_init_workflow_combo.setEnabled(not self.busy and not scan_running)
         self.sweep_post_workflow_combo.setEnabled(not self.busy and not scan_running)
         self.sweep_iterations_spin.setEnabled(not self.busy and not scan_running)
@@ -10391,11 +11151,31 @@ class MainWindow(QMainWindow):
         for button in (
             self.read_case_btn,
             self.read_data_btn,
+            self.read_mesh_btn,
             self.write_case_btn,
             self.write_data_btn,
             self.write_case_data_btn,
         ):
             button.setEnabled(not self.busy and has_session)
+        mesh_ready = not self.busy and not self.mesh_refresh_active
+        selected_mesh_path = self._selected_mesh_file_path()
+        has_mesh_selection = bool(selected_mesh_path)
+        selected_mesh_hidden = bool(selected_mesh_path and self._is_mesh_hidden(selected_mesh_path))
+        self.mesh_folder_edit.setEnabled(mesh_ready)
+        self.browse_mesh_folder_btn.setEnabled(mesh_ready)
+        self.add_mesh_folder_btn.setEnabled(mesh_ready)
+        self.remove_mesh_folder_btn.setEnabled(mesh_ready and bool(combo_text(self.mesh_folder_edit)))
+        self.mesh_recursive_checkbox.setEnabled(mesh_ready)
+        self.mesh_keep_case_checkbox.setEnabled(not self.busy)
+        self.show_hidden_mesh_checkbox.setEnabled(mesh_ready)
+        self.mesh_filter_edit.setEnabled(mesh_ready)
+        self.hide_selected_mesh_btn.setEnabled(mesh_ready and has_mesh_selection and not selected_mesh_hidden)
+        self.unhide_selected_mesh_btn.setEnabled(mesh_ready and has_mesh_selection and selected_mesh_hidden)
+        self.refresh_mesh_files_btn.setEnabled(mesh_ready and bool(combo_text(self.mesh_folder_edit)))
+        self.refresh_all_mesh_files_btn.setEnabled(mesh_ready and self.mesh_folder_edit.count() > 0)
+        self.open_mesh_folder_btn.setEnabled(not self.busy)
+        self.read_selected_mesh_btn.setEnabled(not self.busy and has_session and has_mesh_selection)
+        self.mesh_file_table.setEnabled(not self.busy and not self.mesh_refresh_active)
         for button in (
             self.open_work_btn,
             self.open_case_btn,

@@ -23,6 +23,13 @@ dist/
 # Fluent/UDF generated outputs
 workspace/
 libudf/
+fluent_outputs/**
+!fluent_outputs/
+!fluent_outputs/**/
+!fluent_outputs/README.md
+!fluent_outputs/**/README.md
+!fluent_outputs/**/STATUS.md
+runs/
 _tmp*/
 _fluent_menu_*/
 _sweep_smoke_*/
